@@ -19,6 +19,9 @@ ACKED = "ACKED"            # 已拿到原节点成功回执
 TIMEOUT_UNCERTAIN = "TIMEOUT_UNCERTAIN"  # 写入已落库但回执超时，结果不确定
 FAILED = "FAILED"          # 节点明确拒绝（连接前失败/5xx），未送达
 
+# 未决状态：仍需向原送达节点取回执/核实，存在其中任何一种即阻止节点排空下线。
+UNRESOLVED_STATUSES = (PENDING, TIMEOUT_UNCERTAIN)
+
 # 单连接 + 单写锁，SQLite 写入串行化，避免 lock 竞争。
 _conn: aiosqlite.Connection | None = None
 _write_lock: Any = None
@@ -178,10 +181,60 @@ async def get_write(write_id: str) -> dict[str, Any] | None:
     return dict(row) if row else None
 
 
-async def list_writes() -> list[dict[str, Any]]:
-    cur = await _conn.execute("SELECT * FROM writes ORDER BY created_at DESC LIMIT 200")
+async def list_writes(limit: int = 200) -> list[dict[str, Any]]:
+    """近期写入列表（限量，仅供页面展示）。排空判断禁止用本函数，必须用
+    node_status_counts / list_unresolved_writes 的全量结果。"""
+    cur = await _conn.execute(
+        "SELECT * FROM writes ORDER BY created_at DESC LIMIT ?", (limit,)
+    )
     rows = await cur.fetchall()
     return [dict(r) for r in rows]
+
+
+async def count_writes() -> int:
+    cur = await _conn.execute("SELECT COUNT(*) AS c FROM writes")
+    row = await cur.fetchone()
+    return int(row["c"])
+
+
+async def node_status_counts() -> dict[str, dict[str, int]]:
+    """全量聚合每个节点各状态的写入数（无 LIMIT）。
+
+    排空判断的唯一权威数据源：早期 PENDING/TIMEOUT_UNCERTAIN 即使已被挤出
+    "最近 200 条"展示列表，这里依然统计得到，不会被漏掉。
+    """
+    cur = await _conn.execute(
+        "SELECT target_node, status, COUNT(*) AS c FROM writes "
+        "GROUP BY target_node, status"
+    )
+    rows = await cur.fetchall()
+    out: dict[str, dict[str, int]] = {}
+    for r in rows:
+        out.setdefault(r["target_node"], {})[r["status"]] = int(r["c"])
+    return out
+
+
+async def list_unresolved_writes(node: str) -> list[dict[str, Any]]:
+    """某节点全部未决写入（PENDING + TIMEOUT_UNCERTAIN），全量无截断。
+
+    值班工程师下线旧节点前用它找全"还必须向该节点取回执/核实"的写入。
+    """
+    cur = await _conn.execute(
+        "SELECT * FROM writes WHERE target_node = ? AND status IN (?, ?) "
+        "ORDER BY created_at",
+        (node, PENDING, TIMEOUT_UNCERTAIN),
+    )
+    rows = await cur.fetchall()
+    return [dict(r) for r in rows]
+
+
+async def count_unresolved() -> int:
+    cur = await _conn.execute(
+        "SELECT COUNT(*) AS c FROM writes WHERE status IN (?, ?)",
+        (PENDING, TIMEOUT_UNCERTAIN),
+    )
+    row = await cur.fetchone()
+    return int(row["c"])
 
 
 async def add_event(kind: str, message: str) -> None:

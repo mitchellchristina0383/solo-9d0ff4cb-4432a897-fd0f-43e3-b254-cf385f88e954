@@ -53,7 +53,13 @@ async def lifespan(app: FastAPI):
         # 显式关闭 httpx 默认的连接重试，保证"一次投递"语义。
         limits=httpx.Limits(max_connections=100),
     )
-    await db.add_event("BOOT", f"proxy started, active={await db.get_active()}")
+    unresolved = await db.count_unresolved()
+    await db.add_event(
+        "BOOT",
+        f"proxy started, active={await db.get_active()}, "
+        f"unresolved_writes_carried_over={unresolved} "
+        "(drain state is derived from persisted writes, surviving restarts)",
+    )
     try:
         yield
     finally:
@@ -138,11 +144,6 @@ async def switch(request: Request) -> JSONResponse:
 
 # ---------------------------------------------------------------- 写入代理
 
-async def _track(node: str, write_id: str) -> None:
-    async with _inflight_lock:
-        _inflight.setdefault(node, set()).add(write_id)
-
-
 async def _untrack(node: str, write_id: str) -> None:
     async with _inflight_lock:
         _inflight.setdefault(node, set()).discard(write_id)
@@ -159,15 +160,21 @@ async def proxy_write(request: Request) -> JSONResponse:
     if not isinstance(body, dict):
         body = {"payload": body}
 
-    # 关键：路由在投递前快照，切流不影响本请求。
-    active = await db.get_active()
-    base_url = await db.node_url(active)
-    write_id = str(body.get("id") or uuid.uuid4())
-    body["id"] = write_id
-    payload = str(body.get("payload", ""))
-
-    await db.insert_write(write_id, active, payload, delay)
-    await _track(active, write_id)
+    # 关键：路由快照 + PENDING 落库 + 在途登记在同一个临界区内完成，
+    # 与 /api/switch 的 set_active 互斥（同一把 _inflight_lock）。
+    # 因此切流生效后，任何新写入要么快照到新节点，要么已在旧节点的在途集合里
+    # 被排空判断看到——不存在"已快照旧节点但排空统计看不到"的窗口。
+    async with _inflight_lock:
+        active = await db.get_active()
+        base_url = await db.node_url(active)
+        if base_url is None:
+            return JSONResponse(status_code=500,
+                                content={"error": f"active node {active} not registered"})
+        write_id = str(body.get("id") or uuid.uuid4())
+        body["id"] = write_id
+        payload = str(body.get("payload", ""))
+        await db.insert_write(write_id, active, payload, delay)
+        _inflight.setdefault(active, set()).add(write_id)
     client: httpx.AsyncClient = app.state.http
     try:
         resp = await client.post(
@@ -266,6 +273,15 @@ async def refresh_write(write_id: str) -> JSONResponse:
         )
         await db.add_event("WRITE_RESOLVED",
                            f"{write_id} confirmed acked by original node {node}")
+    elif (data.get("status") == "pending"
+          and row["status"] in db.UNRESOLVED_STATUSES):
+        # 原节点确认已落库、但回执尚未完成：仍属未决，继续阻止排空；
+        # 仅把"已确认送达"这一事实写进说明，状态保持不变。
+        await db.update_write_status(
+            write_id, row["status"],
+            f"original node {node} has it persisted, ack still in flight; "
+            "stays unresolved and keeps blocking drain",
+        )
     refreshed = await db.get_write(write_id)
     return JSONResponse(content={"refreshed": True, "write": refreshed,
                                  "backend_view": data})
@@ -277,31 +293,43 @@ async def refresh_write(write_id: str) -> JSONResponse:
 async def status() -> JSONResponse:
     active = await db.get_active()
     health = await node_health_map()
-    writes = await db.list_writes()
+    # 展示列表限量（最近 200 条），但排空判断绝不用它——
+    # 早期未决写入被挤出展示列表时，排空结论也不能被带偏。
+    writes = await db.list_writes(limit=200)
+    writes_total = await db.count_writes()
+    # 全量聚合（无 LIMIT）：每个节点各状态写入数，排空判断的权威数据源。
+    counts = await db.node_status_counts()
 
     async with _inflight_lock:
         inflight_counts = {k: len(v) for k, v in _inflight.items()}
         inflight_ids = {k: sorted(v) for k, v in _inflight.items()}
 
-    # 排空视角：已切走的旧节点上仍未拿到回执的写入。
+    # 排空视角：非现役节点上是否还有"必须向它取回执/核实"的写入。
+    # 未决 = 持久化的 PENDING + TIMEOUT_UNCERTAIN（全量），并叠加当前在途请求
+    # （在途请求在临界区内已落库为 PENDING，理论上被前者覆盖；双保险）。
     per_node: dict[str, dict[str, Any]] = {}
-    for w in writes:
-        slot = per_node.setdefault(
-            w["target_node"], {"total": 0, "pending": 0, "acked": 0,
-                               "timeout_uncertain": 0, "failed": 0}
-        )
-        slot["total"] += 1
-        slot[w["status"].lower()] = slot.get(w["status"].lower(), 0) + 1
-    for name in health:
-        per_node.setdefault(name, {"total": 0, "pending": 0, "acked": 0,
-                                   "timeout_uncertain": 0, "failed": 0})
-    for name, slot in per_node.items():
-        slot["inflight_now"] = inflight_counts.get(name, 0)
-        slot["inflight_ids"] = inflight_ids.get(name, [])
-        slot["is_active"] = name == active
-        slot["draining"] = name != active and (
-            slot["inflight_now"] > 0 or slot["pending"] > 0
-        )
+    for name in list(health) + [n for n in counts if n not in health]:
+        c = counts.get(name, {})
+        pending = c.get(db.PENDING, 0)
+        timeout_uncertain = c.get(db.TIMEOUT_UNCERTAIN, 0)
+        unresolved = pending + timeout_uncertain
+        inflight_now = inflight_counts.get(name, 0)
+        is_active = name == active
+        draining = (not is_active) and (unresolved > 0 or inflight_now > 0)
+        per_node[name] = {
+            "total": sum(c.values()),
+            "pending": pending,
+            "acked": c.get(db.ACKED, 0),
+            "timeout_uncertain": timeout_uncertain,
+            "failed": c.get(db.FAILED, 0),
+            "unresolved": unresolved,
+            "inflight_now": inflight_now,
+            "inflight_ids": inflight_ids.get(name, []),
+            "is_active": is_active,
+            "draining": draining,
+            # 已排空：非现役且无任何未决/在途，可安全下线。
+            "drained": (not is_active) and not draining,
+        }
 
     return JSONResponse(content={
         "ts": time.time(),
@@ -309,9 +337,37 @@ async def status() -> JSONResponse:
         "nodes": health,
         "drainage": per_node,
         "writes": writes,
+        "writes_limit": 200,
+        "writes_total": writes_total,
         "events": await db.list_events(),
         "timeouts": {"connect": CONNECT_TIMEOUT, "read": READ_TIMEOUT,
                      "probe": PROBE_TIMEOUT},
+    })
+
+
+@app.get("/api/nodes/{name}/unresolved")
+async def node_unresolved(name: str) -> JSONResponse:
+    """某节点全部未决写入（PENDING + TIMEOUT_UNCERTAIN，全量无截断）。
+
+    下线旧节点前用它找全还必须向该节点取回执/核实的写入，
+    配合 /api/writes/{id}/refresh 逐笔向原节点核实。
+    """
+    if await db.node_url(name) is None:
+        return JSONResponse(status_code=404, content={"error": f"unknown node {name}"})
+    rows = await db.list_unresolved_writes(name)
+    active = await db.get_active()
+    async with _inflight_lock:
+        inflight_ids = sorted(_inflight.get(name, set()))
+    draining = name != active and (len(rows) > 0 or len(inflight_ids) > 0)
+    return JSONResponse(content={
+        "node": name,
+        "is_active": name == active,
+        "unresolved_count": len(rows),
+        "inflight_now": len(inflight_ids),
+        "inflight_ids": inflight_ids,
+        "draining": draining,
+        "drained": name != active and not draining,
+        "writes": rows,
     })
 
 

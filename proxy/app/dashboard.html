@@ -78,7 +78,8 @@
   </section>
 
   <section class="card">
-    <h2>代理侧写入记录（含排空视角：非现役节点上未回执的写入）</h2>
+    <h2>代理侧写入记录（近期列表限量展示；排空判断基于全量持久写入，不受此限量影响）</h2>
+    <div class="muted" id="writes-caption" style="margin-bottom:6px"></div>
     <div style="overflow:auto"><table id="writes">
       <thead><tr><th>写入 ID</th><th>送达节点</th><th>状态</th><th>说明</th><th>时间</th><th></th></tr></thead>
       <tbody></tbody>
@@ -86,6 +87,8 @@
     <p class="uncertain-note" style="margin-top:12px">
       ⚠️ <b>TIMEOUT_UNCERTAIN</b>：写入已在后端落库但回执超时，结果不确定。
       系统<b>不会</b>自动向另一节点补投；可点"向原节点查询"核实（切流后仍查原送达节点）。
+      <b>PENDING</b> 与 <b>TIMEOUT_UNCERTAIN</b> 都属于未决写入，会阻止旧节点排空下线；
+      节点卡片上的"未决写入"按钮可找全该节点<b>全部</b>未决写入并逐笔核实。
     </p>
   </section>
 
@@ -154,6 +157,62 @@ async function refreshOne(id){
   }catch(e){ toast('查询失败：'+e.message, false); }
 }
 
+// ---- 按节点找全未决写入并逐笔核实 ----
+const openPanels = new Set();   // 当前展开"未决写入"面板的节点
+async function toggleUnresolved(name){
+  if(openPanels.has(name)){ openPanels.delete(name); }
+  else{ openPanels.add(name); }
+  await refresh();
+}
+async function renderUnresolved(name){
+  const box = document.getElementById('unresolved-'+name);
+  if(!box) return;
+  if(!openPanels.has(name)){ box.innerHTML=''; return; }
+  let r;
+  try{ r = await api(`/api/nodes/${encodeURIComponent(name)}/unresolved`); }
+  catch(e){ box.innerHTML = `<div class="muted">加载失败：${esc(e.message)}</div>`; return; }
+  const rows = r.writes.map(w => `<tr>
+    <td class="mono" title="${esc(w.id)}">${esc(w.id.slice(0,8))}…</td>
+    <td>${statusBadge(w.status)}</td>
+    <td class="muted">${fmt(w.created_at)}</td>
+    <td class="muted" style="max-width:320px">${esc(w.status_detail)}</td>
+    <td><button onclick="verifyOne('${esc(w.id)}','${esc(name)}')">向原节点核实</button></td>
+  </tr>`).join('');
+  box.innerHTML = `<div style="margin-top:10px;border-top:1px dashed var(--line);padding-top:10px">
+    <div class="row" style="margin-bottom:8px">
+      <b>节点 ${esc(name)} 的未决写入：${r.unresolved_count} 笔</b>
+      ${r.inflight_now?`<span class="badge b-warn">在途 ${r.inflight_now}</span>`:''}
+      ${r.drained?'<span class="badge b-ok">已排空，可安全下线</span>':''}
+      ${r.unresolved_count?`<button onclick="verifyAll('${esc(name)}')">全部逐笔核实</button>`:''}
+    </div>
+    ${r.unresolved_count ? `<table><thead><tr><th>写入 ID</th><th>状态</th><th>时间</th><th>说明</th><th></th></tr></thead>
+      <tbody>${rows}</tbody></table>`
+      : '<div class="muted">该节点没有未决写入。</div>'}
+  </div>`;
+}
+async function verifyOne(id, name){
+  try{
+    const r = await api(`/api/writes/${encodeURIComponent(id)}/refresh`);
+    toast(r.note ? r.note : `核实 ${id.slice(0,8)}…：${r.write.status}`,
+          r.write && r.write.status==='ACKED');
+  }catch(e){ toast('核实失败（保持未决）：'+e.message, false); }
+  await refresh();
+}
+async function verifyAll(name){
+  let r;
+  try{ r = await api(`/api/nodes/${encodeURIComponent(name)}/unresolved`); }
+  catch(e){ toast('加载未决写入失败：'+e.message, false); return; }
+  let ok=0, keep=0;
+  for(const w of r.writes){
+    try{
+      const rr = await api(`/api/writes/${encodeURIComponent(w.id)}/refresh`);
+      if(rr.write && rr.write.status==='ACKED') ok++; else keep++;
+    }catch(e){ keep++; }
+  }
+  toast(`节点 ${name} 核实完成：${ok} 笔确认回执，${keep} 笔仍未决（失败/不可达保持未决）`, keep===0);
+  await refresh();
+}
+
 $('#send').onclick = async () => {
   const btn = $('#send'); btn.disabled = true; btn.textContent = '投递中…';
   const payload = $('#payload').value.trim() || ('auto-'+Date.now());
@@ -178,27 +237,35 @@ async function refresh(){
   $('#nodes').innerHTML = Object.entries(s.nodes).map(([name, h]) => {
     const d = s.drainage[name] || {};
     const isActive = name === s.active;
+    const unresolved = d.unresolved ?? ((d.pending??0)+(d.timeout_uncertain??0));
     return `<div class="card node" style="padding:14px">
       <div class="row"><b style="font-size:16px">节点 ${esc(name)}</b>
         <span class="badge ${h.healthy?'b-ok':'b-bad'}">${h.healthy?'健康':'故障/不可达'}</span>
         ${isActive?'<span class="badge b-info">现役 ACTIVE</span>':'<span class="badge b-mut">备用 STANDBY</span>'}
-        ${d.draining?'<span class="badge b-warn">排空中 DRAINING</span>':''}
+        ${d.draining?`<span class="badge b-warn">排空中 DRAINING · 未决 ${unresolved}</span>`:''}
+        ${d.drained?'<span class="badge b-ok">已排空 DRAINED · 可安全下线</span>':''}
       </div>
       <div class="muted mono" style="font-size:12px">${esc(h.base_url)}</div>
       <div class="muted" style="font-size:12px">探测：${esc(h.detail)}</div>
       <div class="kv">
         <b>在途(未回执)</b><span>${d.inflight_now??0} 个 ${(d.inflight_ids||[]).length?('<code>'+d.inflight_ids.map(esc).join(', ')+'</code>'):''}</span>
-        <b>写入总数</b><span>${d.total??0}</span>
-        <b>已回执 / 待回执 / 不确定 / 失败</b>
-        <span>${d.acked??0} / ${d.pending??0} / ${d.timeout_uncertain??0} / ${d.failed??0}</span>
+        <b>未决写入(全量)</b><span>${unresolved} 笔（PENDING ${d.pending??0} + 不确定 ${d.timeout_uncertain??0}）</span>
+        <b>写入总数(全量)</b><span>${d.total??0}</span>
+        <b>已回执 / 失败</b><span>${d.acked??0} / ${d.failed??0}</span>
       </div>
       <div class="row">
         <button class="primary" ${isActive?'disabled':''} onclick="switchTo('${esc(name)}')">切换流量到 ${esc(name)}</button>
         <button class="danger" onclick="setFault('${esc(name)}', true)">注入健康故障</button>
         <button onclick="setFault('${esc(name)}', false)">解除故障</button>
+        <button onclick="toggleUnresolved('${esc(name)}')">${openPanels.has(name)?'收起未决写入':'未决写入'}（${unresolved}）</button>
       </div>
+      <div id="unresolved-${esc(name)}"></div>
     </div>`;
   }).join('');
+  for(const name of openPanels){ await renderUnresolved(name); }
+
+  $('#writes-caption').textContent =
+    `仅显示最近 ${s.writes_limit} 条（持久化写入共 ${s.writes_total} 条）；排空/未决统计始终基于全量。`;
 
   $('#writes tbody').innerHTML = s.writes.map(w => `<tr>
     <td class="mono">${esc(w.id.slice(0,8))}…</td>
